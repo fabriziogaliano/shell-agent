@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -288,37 +289,46 @@ Rules:
 
 
 def run_command(command: str, working_dir: str | None = None, timeout: int = 30) -> dict:
-    """Execute *command* in a subprocess and return a result dict."""
+    """Execute *command* in a subprocess, interruptible via Ctrl+C."""
     cwd = working_dir or WORKING_DIR
     timeout = max(1, min(timeout, 300))
 
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             command,
             shell=True,
             cwd=cwd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
         )
-        stdout = result.stdout[:OUTPUT_CAP]
-        stderr = result.stderr[:OUTPUT_CAP]
-        if result.stdout and len(result.stdout) > OUTPUT_CAP:
-            stdout += f"\n[... output truncated at {OUTPUT_CAP} chars ...]"
-        if result.stderr and len(result.stderr) > OUTPUT_CAP:
-            stderr += f"\n[... stderr truncated at {OUTPUT_CAP} chars ...]"
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except KeyboardInterrupt:
+            proc.kill()
+            proc.wait()
+            raise
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            return {
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": f"Command timed out after {timeout} seconds.",
+            }
+
+        if len(stdout) > OUTPUT_CAP:
+            stdout = stdout[:OUTPUT_CAP] + f"\n[... output truncated at {OUTPUT_CAP} chars ...]"
+        if len(stderr) > OUTPUT_CAP:
+            stderr = stderr[:OUTPUT_CAP] + f"\n[... stderr truncated at {OUTPUT_CAP} chars ...]"
 
         return {
-            "exit_code": result.returncode,
+            "exit_code": proc.returncode,
             "stdout": stdout,
             "stderr": stderr,
         }
-    except subprocess.TimeoutExpired:
-        return {
-            "exit_code": -1,
-            "stdout": "",
-            "stderr": f"Command timed out after {timeout} seconds.",
-        }
+    except KeyboardInterrupt:
+        raise
     except Exception as exc:
         return {
             "exit_code": -1,
@@ -388,15 +398,47 @@ def dispatch_tool(name: str, arguments: str, step: int) -> str | None:
             })
 
     # ── Execute ──────────────────────────────────────────────────────
-    with Live(
-        Spinner("dots", text=Text(f"  Esecuzione: {command[:80]}...", style="dim")),
-        console=console,
-        transient=True,
-    ):
-        outcome = run_command(command, wdir, timeout)
+    console.print(f"  [dim]$ {command}[/dim]")
+    outcome = run_command(command, wdir, timeout)
 
     print_command_result(command, outcome, step)
     return json.dumps(outcome)
+
+
+# ── Interruptible LLM call ────────────────────────────────────────────────────
+
+
+def llm_call(client: OpenAI, spinner_msg: str, **kwargs):
+    """
+    Run client.chat.completions.create() in a daemon thread so that the main
+    thread stays responsive to Ctrl+C.  A spinner is shown while waiting.
+    """
+    result_box: dict = {}
+
+    def _call():
+        try:
+            result_box["ok"] = client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            result_box["err"] = exc
+
+    thread = threading.Thread(target=_call, daemon=True)
+    thread.start()
+
+    try:
+        with Live(
+            Spinner("dots", text=Text(f"  {spinner_msg}", style="dim italic")),
+            console=console,
+            transient=True,
+        ):
+            while thread.is_alive():
+                thread.join(timeout=0.3)
+    except KeyboardInterrupt:
+        # The daemon thread will be abandoned — it has no side-effects
+        raise
+
+    if "err" in result_box:
+        raise result_box["err"]
+    return result_box["ok"]
 
 
 # ── History management ────────────────────────────────────────────────────────
@@ -450,7 +492,8 @@ def run_agent(client: OpenAI, user_message: str, history: list[dict], working_di
                 ),
             })
             # One last call without tools to get a summary
-            response = client.chat.completions.create(
+            response = llm_call(
+                client, "Riepilogo...",
                 model=MODEL,
                 messages=[{"role": "system", "content": build_system_prompt(working_dir)}] + history,
             )
@@ -459,17 +502,13 @@ def run_agent(client: OpenAI, user_message: str, history: list[dict], working_di
             return msg.content or "(nessuna risposta)"
 
         # ── LLM call ────────────────────────────────────────────────
-        with Live(
-            Spinner("dots", text=Text("  Thinking...", style="dim italic")),
-            console=console,
-            transient=True,
-        ):
-            response = client.chat.completions.create(
-                model=MODEL,
-                messages=[{"role": "system", "content": build_system_prompt(working_dir)}] + history,
-                tools=TOOLS,
-                tool_choice="auto",
-            )
+        response = llm_call(
+            client, "Thinking...",
+            model=MODEL,
+            messages=[{"role": "system", "content": build_system_prompt(working_dir)}] + history,
+            tools=TOOLS,
+            tool_choice="auto",
+        )
 
         message = response.choices[0].message
         history.append(message.model_dump(exclude_unset=True))
