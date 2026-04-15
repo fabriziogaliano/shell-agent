@@ -9,7 +9,6 @@ import os
 import re
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -361,27 +360,24 @@ def dispatch_tool(name: str, arguments: str, step: int) -> str | None:
     # ── Security check ───────────────────────────────────────────────
     safety, reason = check_command_safety(command)
 
-    if safety == "blocked":
-        console.print(Panel(
-            f"[bold red]BLOCCATO[/bold red]: {reason}\n"
-            f"Comando: [dim]{command}[/dim]",
-            title="Sicurezza",
-            border_style="red",
-        ))
-        return json.dumps({
-            "exit_code": -1,
-            "stdout": "",
-            "stderr": f"BLOCKED by safety filter: {reason}. "
-                       "This command is not allowed. Use a safer alternative.",
-        })
+    if safety in ("blocked", "confirm"):
+        is_critical = safety == "blocked"
+        level = "CRITICO" if is_critical else "Richiesta conferma"
+        style = "bold red" if is_critical else "bold yellow"
+        border = "red" if is_critical else "yellow"
 
-    if safety == "confirm":
+        # Show only the first 5 lines of the command to keep the panel readable
+        cmd_preview = command.strip()
+        cmd_lines = cmd_preview.splitlines()
+        if len(cmd_lines) > 5:
+            cmd_preview = "\n".join(cmd_lines[:5]) + f"\n... ({len(cmd_lines) - 5} righe omesse)"
+
         console.print()
         console.print(Panel(
-            f"[bold yellow]Richiesta conferma[/bold yellow]: {reason}\n"
-            f"Comando: [bold]{command}[/bold]",
+            f"[{style}]{level}[/{style}]: {reason}\n"
+            f"Comando:\n[dim]{cmd_preview}[/dim]",
             title="Sicurezza",
-            border_style="yellow",
+            border_style=border,
         ))
         try:
             approved = Confirm.ask("  Vuoi eseguire questo comando?", default=False)
@@ -405,24 +401,24 @@ def dispatch_tool(name: str, arguments: str, step: int) -> str | None:
     return json.dumps(outcome)
 
 
-# ── Interruptible LLM call ────────────────────────────────────────────────────
+# ── Interruptible streaming LLM call ─────────────────────────────────────────
 
 
 def llm_call(client: OpenAI, spinner_msg: str, **kwargs):
     """
-    Run client.chat.completions.create() in a daemon thread so that the main
-    thread stays responsive to Ctrl+C.  A spinner is shown while waiting.
+    Call the LLM using **streaming**.  This gives us two things:
+    1. Ctrl+C closes the HTTP connection → LMStudio stops generating.
+    2. We can show a live spinner that proves the model is working.
+
+    Returns a synthetic message object compatible with the non-streaming API
+    (has .content and .tool_calls attributes).
     """
-    result_box: dict = {}
+    stream = client.chat.completions.create(**kwargs, stream=True)
 
-    def _call():
-        try:
-            result_box["ok"] = client.chat.completions.create(**kwargs)
-        except Exception as exc:
-            result_box["err"] = exc
-
-    thread = threading.Thread(target=_call, daemon=True)
-    thread.start()
+    # Accumulators
+    content_parts: list[str] = []
+    tool_calls_map: dict[int, dict] = {}   # index → {id, name, arguments}
+    got_first_chunk = False
 
     try:
         with Live(
@@ -430,15 +426,84 @@ def llm_call(client: OpenAI, spinner_msg: str, **kwargs):
             console=console,
             transient=True,
         ):
-            while thread.is_alive():
-                thread.join(timeout=0.3)
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+
+                delta = chunk.choices[0].delta
+                got_first_chunk = True
+
+                # Text content
+                if delta.content:
+                    content_parts.append(delta.content)
+
+                # Tool calls (streamed incrementally)
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in tool_calls_map:
+                            tool_calls_map[idx] = {
+                                "id": tc_delta.id or "",
+                                "name": "",
+                                "arguments": "",
+                            }
+                        entry = tool_calls_map[idx]
+                        if tc_delta.id:
+                            entry["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                entry["name"] = tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                entry["arguments"] += tc_delta.function.arguments
+
     except KeyboardInterrupt:
-        # The daemon thread will be abandoned — it has no side-effects
+        # Close the stream → LMStudio stops generating immediately
+        stream.close()
         raise
 
-    if "err" in result_box:
-        raise result_box["err"]
-    return result_box["ok"]
+    # Build a simple namespace that looks like message.content / message.tool_calls
+    class _Function:
+        def __init__(self, name, arguments):
+            self.name = name
+            self.arguments = arguments
+
+    class _ToolCall:
+        def __init__(self, id, function):
+            self.id = id
+            self.function = function
+
+    class _Message:
+        def __init__(self, content, tool_calls):
+            self.content = content
+            self.tool_calls = tool_calls if tool_calls else None
+            self.role = "assistant"
+
+        def model_dump(self, **kw):
+            d: dict = {"role": self.role, "content": self.content}
+            if self.tool_calls:
+                d["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in self.tool_calls
+                ]
+            return d
+
+    content = "".join(content_parts) or None
+    tool_calls = [
+        _ToolCall(
+            id=entry["id"],
+            function=_Function(name=entry["name"], arguments=entry["arguments"]),
+        )
+        for _, entry in sorted(tool_calls_map.items())
+    ] or None
+
+    return _Message(content=content, tool_calls=tool_calls)
 
 
 # ── History management ────────────────────────────────────────────────────────
@@ -492,26 +557,23 @@ def run_agent(client: OpenAI, user_message: str, history: list[dict], working_di
                 ),
             })
             # One last call without tools to get a summary
-            response = llm_call(
+            message = llm_call(
                 client, "Riepilogo...",
                 model=MODEL,
                 messages=[{"role": "system", "content": build_system_prompt(working_dir)}] + history,
             )
-            msg = response.choices[0].message
-            history.append(msg.model_dump(exclude_unset=True))
-            return msg.content or "(nessuna risposta)"
+            history.append(message.model_dump())
+            return message.content or "(nessuna risposta)"
 
         # ── LLM call ────────────────────────────────────────────────
-        response = llm_call(
+        message = llm_call(
             client, "Thinking...",
             model=MODEL,
             messages=[{"role": "system", "content": build_system_prompt(working_dir)}] + history,
             tools=TOOLS,
             tool_choice="auto",
         )
-
-        message = response.choices[0].message
-        history.append(message.model_dump(exclude_unset=True))
+        history.append(message.model_dump())
 
         # ── No tool calls → final text answer ───────────────────────
         if not message.tool_calls:
