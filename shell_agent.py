@@ -69,7 +69,7 @@ MAX_HISTORY = int(os.getenv("SHELL_AGENT_MAX_HISTORY", "40"))
 
 # ── Security ─────────────────────────────────────────────────────────────────
 
-# Commands that are always blocked — no bypass
+# Commands that are extremely dangerous — require DOUBLE confirmation
 BLOCKED_COMMANDS = [
     r"\brm\s+(-[a-zA-Z]*)?.*\s+/\s*$",       # rm /  or rm -rf /
     r"\bmkfs\b",                                # format disk
@@ -120,9 +120,9 @@ def check_command_safety(command: str) -> tuple[str, str | None]:
     Check if a command is safe to execute.
 
     Returns:
-        ("blocked", reason)   — command must NOT run
-        ("confirm", reason)   — command needs user confirmation
-        ("safe", None)        — command is safe to run
+        ("blocked", reason)   — extremely dangerous, requires DOUBLE confirmation
+        ("confirm", reason)   — dangerous, requires single confirmation
+        ("safe", None)        — normal command, still requires confirmation (hard warning)
     """
     cmd_lower = command.lower().strip()
 
@@ -360,27 +360,99 @@ def dispatch_tool(name: str, arguments: str, step: int) -> str | None:
     # ── Security check ───────────────────────────────────────────────
     safety, reason = check_command_safety(command)
 
-    if safety in ("blocked", "confirm"):
-        is_critical = safety == "blocked"
-        level = "CRITICO" if is_critical else "Richiesta conferma"
-        style = "bold red" if is_critical else "bold yellow"
-        border = "red" if is_critical else "yellow"
+    # Show only the first 5 lines of the command to keep the panel readable
+    cmd_preview = command.strip()
+    cmd_lines = cmd_preview.splitlines()
+    if len(cmd_lines) > 5:
+        cmd_preview = "\n".join(cmd_lines[:5]) + f"\n... ({len(cmd_lines) - 5} righe omesse)"
 
-        # Show only the first 5 lines of the command to keep the panel readable
-        cmd_preview = command.strip()
-        cmd_lines = cmd_preview.splitlines()
-        if len(cmd_lines) > 5:
-            cmd_preview = "\n".join(cmd_lines[:5]) + f"\n... ({len(cmd_lines) - 5} righe omesse)"
+    if safety == "blocked":
+        # ── Extremely dangerous: double confirmation ────────────
+        console.print()
+        console.print(Panel(
+            f"[bold red]⚠  CRITICO ⚠[/bold red]: {reason}\n"
+            f"Comando:\n[dim]{cmd_preview}[/dim]\n\n"
+            "[bold red]Questo comando è ESTREMAMENTE PERICOLOSO e potrebbe "
+            "causare danni irreversibili al sistema.[/bold red]",
+            title="🚨 Sicurezza — Livello CRITICO",
+            border_style="red",
+        ))
+        try:
+            first = Confirm.ask(
+                "  [bold red]Prima conferma[/bold red] — Vuoi davvero eseguire questo comando?",
+                default=False,
+            )
+        except (EOFError, KeyboardInterrupt):
+            first = False
+
+        if not first:
+            console.print("  [dim]Comando rifiutato dall'utente.[/dim]")
+            return json.dumps({
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": "Command DENIED by user. Do NOT retry this command. "
+                          "Ask the user what they would like to do instead.",
+            })
 
         console.print()
         console.print(Panel(
-            f"[{style}]{level}[/{style}]: {reason}\n"
+            f"[bold red]Stai per eseguire un comando CRITICO.[/bold red]\n"
+            f"Comando:\n[dim]{cmd_preview}[/dim]\n\n"
+            "[bold red]Sei ASSOLUTAMENTE SICURO? Questa azione potrebbe essere irreversibile.[/bold red]",
+            title="🚨 Seconda conferma richiesta",
+            border_style="red",
+        ))
+        try:
+            second = Confirm.ask(
+                "  [bold red]Seconda conferma[/bold red] — Confermi DEFINITIVAMENTE l'esecuzione?",
+                default=False,
+            )
+        except (EOFError, KeyboardInterrupt):
+            second = False
+
+        if not second:
+            console.print("  [dim]Comando rifiutato dall'utente alla seconda conferma.[/dim]")
+            return json.dumps({
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": "Command DENIED by user at second confirmation. Do NOT retry this command. "
+                          "Ask the user what they would like to do instead.",
+            })
+
+    elif safety == "confirm":
+        # ── Dangerous: single confirmation ──────────────────────
+        console.print()
+        console.print(Panel(
+            f"[bold yellow]⚠ Richiesta conferma[/bold yellow]: {reason}\n"
             f"Comando:\n[dim]{cmd_preview}[/dim]",
-            title="Sicurezza",
-            border_style=border,
+            title="⚠ Sicurezza — Comando potenzialmente pericoloso",
+            border_style="yellow",
         ))
         try:
             approved = Confirm.ask("  Vuoi eseguire questo comando?", default=False)
+        except (EOFError, KeyboardInterrupt):
+            approved = False
+
+        if not approved:
+            console.print("  [dim]Comando rifiutato dall'utente.[/dim]")
+            return json.dumps({
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": "Command DENIED by user. Do NOT retry this command. "
+                          "Ask the user what they would like to do instead.",
+            })
+
+    else:
+        # ── Safe: always ask confirmation (hard warning) ────────
+        console.print()
+        console.print(Panel(
+            f"[bold cyan]Esecuzione comando[/bold cyan]\n"
+            f"Comando:\n[dim]{cmd_preview}[/dim]",
+            title="Conferma esecuzione",
+            border_style="cyan",
+        ))
+        try:
+            approved = Confirm.ask("  Vuoi eseguire questo comando?", default=True)
         except (EOFError, KeyboardInterrupt):
             approved = False
 
