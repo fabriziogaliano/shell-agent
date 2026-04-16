@@ -22,7 +22,7 @@ You describe what you need — the agent figures out the right commands, execute
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/shell-agent.git
+git clone https://github.com/fabriziogaliano/shell-agent.git
 cd shell-agent
 
 pip install -r requirements.txt
@@ -73,15 +73,15 @@ Copy `.env.example` to `.env` and adjust the values:
 
 ## Security
 
-The agent enforces two levels of protection:
+The agent enforces three levels of protection:
 
-**Blocked commands** — always rejected, no bypass possible:
+**Critical commands** — require **double confirmation** before execution:
 - Recursive root deletion (`rm -rf /`)
 - Disk formatting (`mkfs`, `dd of=/dev/...`)
 - Fork bombs
 - System halt/reboot/shutdown
 
-**Confirmation required** — the user is prompted before execution:
+**Dangerous commands** — require single confirmation (default: no):
 - File deletion and moves (`rm`, `mv`)
 - Permission/ownership changes (`chmod`, `chown`)
 - Process termination (`kill`, `pkill`)
@@ -90,6 +90,10 @@ The agent enforces two levels of protection:
 - Destructive git operations (`push`, `reset --hard`, `clean`)
 - Remote script execution (`curl | sh`)
 - Firewall and service management
+
+**All other commands** — require confirmation (default: yes):
+- Every command is shown to the user before execution
+- Safe commands default to "yes" but can still be rejected
 
 ## License
 
