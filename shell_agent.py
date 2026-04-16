@@ -586,6 +586,8 @@ def trim_history(history: list[dict]) -> list[dict]:
     Keep history within MAX_HISTORY messages.
     Removes oldest user/assistant/tool turns while keeping
     the most recent context intact.
+    Always ensures history starts with a user message — some model
+    Jinja templates (e.g. holo3) fail with "No user query found" otherwise.
     """
     if len(history) <= MAX_HISTORY:
         return history
@@ -593,9 +595,16 @@ def trim_history(history: list[dict]) -> list[dict]:
     # Keep the last MAX_HISTORY messages
     trimmed = history[-MAX_HISTORY:]
 
-    # Make sure we don't start with a dangling tool result
-    while trimmed and trimmed[0].get("role") == "tool":
+    # Make sure we don't start with a dangling tool result or assistant message
+    while trimmed and trimmed[0].get("role") in ("tool", "assistant"):
         trimmed.pop(0)
+
+    # If no user message survived, keep at least the last user message + everything after
+    if not any(m.get("role") == "user" for m in trimmed):
+        for i in range(len(history) - 1, -1, -1):
+            if history[i].get("role") == "user":
+                trimmed = history[i:]
+                break
 
     return trimmed
 
@@ -638,13 +647,35 @@ def run_agent(client: OpenAI, user_message: str, history: list[dict], working_di
             return message.content or "(nessuna risposta)"
 
         # ── LLM call ────────────────────────────────────────────────
-        message = llm_call(
-            client, "Thinking...",
-            model=MODEL,
-            messages=[{"role": "system", "content": build_system_prompt(working_dir)}] + history,
-            tools=TOOLS,
-            tool_choice="auto",
-        )
+        try:
+            message = llm_call(
+                client, "Thinking...",
+                model=MODEL,
+                messages=[{"role": "system", "content": build_system_prompt(working_dir)}] + history,
+                tools=TOOLS,
+                tool_choice="auto",
+            )
+        except Exception as exc:
+            err_msg = str(exc).lower()
+            if "jinja" in err_msg or "template" in err_msg or "user query" in err_msg:
+                # Model template choked on history — retry with only the last user message
+                console.print("  [dim]Errore template modello, riprovo con contesto ridotto...[/dim]")
+                last_user = user_message
+                for m in reversed(history):
+                    if m.get("role") == "user":
+                        last_user = m["content"]
+                        break
+                history.clear()
+                history.append({"role": "user", "content": last_user})
+                message = llm_call(
+                    client, "Thinking (retry)...",
+                    model=MODEL,
+                    messages=[{"role": "system", "content": build_system_prompt(working_dir)}] + history,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                )
+            else:
+                raise
         history.append(message.model_dump())
 
         # ── No tool calls → final text answer ───────────────────────
